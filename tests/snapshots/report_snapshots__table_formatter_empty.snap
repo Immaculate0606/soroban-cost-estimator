@@ -51,3 +51,5 @@ Note: CPU, storage and transaction-size fees are derived from the network's conf
 
 Optimization Suggestions:
   No cost optimizations identified (fee rates unavailable or no reducible resources).
+
+Simulation latency: 0 ms
