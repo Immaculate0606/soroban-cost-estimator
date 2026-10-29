@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use sha2::Digest;
 use soroban_cost_estimator::cache;
@@ -1186,6 +1187,64 @@ fn test_estimate_cache_hit_skips_simulation() {
 }
 
 #[test]
+fn test_estimate_uses_default_seven_day_cache_ttl() {
+    // A fresh entry is reused even without --cache-ttl because the default
+    // cache TTL is seven days.
+    let home = temp_home("cache-ttl-default");
+    seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(
+        code, 0,
+        "the default TTL should reuse a fresh entry: {stderr}"
+    );
+    assert!(stdout.contains("Cache hit"), "got: {stdout}");
+}
+
+#[test]
+fn test_estimate_uses_cache_ttl_from_config() {
+    // A config TTL of 30 minutes expires this two-hour-old entry, so the
+    // command must attempt simulation instead of reporting a cache hit.
+    let home = temp_home("cache-ttl-config");
+    seed_cache_entry(
+        &home,
+        &(chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339(),
+    );
+    let config = home.join("config.toml");
+    std::fs::write(&config, "cache_ttl = \"30m\"\n").expect("write config");
+
+    let (stdout, stderr, code) = run_cli_in_home(
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "estimate",
+            "--wasm",
+            "tests/fixtures/minimal.wasm",
+            "--rpc-url",
+            DEAD_RPC,
+        ],
+        Some(&home),
+    );
+
+    assert_eq!(code, 1, "the expired entry must re-simulate");
+    assert!(!stdout.contains("Cache hit"), "got: {stdout}");
+    assert!(
+        stderr.contains("HTTP request failed") || stderr.contains("error sending request"),
+        "re-simulation should hit the dead endpoint; got: {stderr}"
+    );
+}
+
+#[test]
 fn test_estimate_cache_hit_json_output() {
     let home = temp_home("cache-ttl-json");
     seed_cache_entry(&home, &chrono::Utc::now().to_rfc3339());
@@ -1340,6 +1399,38 @@ fn test_config_snapshot_retain_flag_accepted() {
             "Error: failed to locate RPC endpoint: not configured for network not-a-network"
         ),
         "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_skip_unchanged_flag_accepted() {
+    // `--skip-unchanged` must be a recognized argument: the run fails on the
+    // unknown network (before any RPC), not on the flag itself.
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "snapshot",
+        "--network",
+        "not-a-network",
+        "--skip-unchanged",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--skip-unchanged should be a recognized argument; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to locate RPC endpoint"),
+        "the failure should come from the network, not the flag; got: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_snapshot_help_documents_skip_unchanged() {
+    let (stdout, stderr, code) = run_cli(&["config", "snapshot", "--help"]);
+    assert_eq!(code, 0, "snapshot --help should exit 0: {stderr}");
+    assert!(
+        stdout.contains("--skip-unchanged"),
+        "snapshot help should document --skip-unchanged; got: {stdout}"
     );
 }
 
@@ -1646,6 +1737,61 @@ fn test_cache_warm_help() {
             "cache warm help should mention {flag}; got: {stdout}"
         );
     }
+}
+
+#[test]
+fn test_config_cache_warm_help() {
+    let (stdout, stderr, code) = run_cli(&["config", "cache", "warm", "--help"]);
+    assert_eq!(
+        code, 0,
+        "config cache warm --help should exit 0; stderr: {stderr}"
+    );
+    for flag in ["--wasm", "--network", "--rpc-url", "--id", "--json"] {
+        assert!(
+            stdout.contains(flag),
+            "config cache warm help should mention {flag}; got: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_config_cache_warm_missing_wasm_errors() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm"]);
+    assert_ne!(code, 0, "config cache warm without --wasm should error");
+    assert!(
+        stderr.contains("error") || stderr.contains("required"),
+        "stderr should indicate error: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_nonexistent_wasm_file() {
+    let (_, stderr, code) = run_cli(&["config", "cache", "warm", "--wasm", "no/such/file.wasm"]);
+    assert_eq!(code, 1, "a missing WASM file should exit 1");
+    assert!(
+        stderr.contains("file not found") || stderr.contains("Error: failed to perform I/O"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_cache_warm_unknown_network() {
+    let (_, stderr, code) = run_cli(&[
+        "config",
+        "cache",
+        "warm",
+        "--wasm",
+        "tests/fixtures/contract.wasm",
+        "--network",
+        "not-a-network",
+    ]);
+    assert_eq!(code, 1, "an unknown network should exit 1");
+    assert!(
+        stderr.contains(
+            "Error: failed to locate RPC endpoint: not configured for network not-a-network"
+        ),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -2302,25 +2448,41 @@ fn test_wasm_info_nested_and_flat_agree() {
 
 #[test]
 fn test_watch_interval_suffixes_are_parsed() {
-    // `30m` must resolve to 1800s in the banner — the interval parser is unit
-    // tested in-crate, this pins the wiring through the CLI.
+    // Every duration suffix (and the bare-seconds form) must resolve to the
+    // right number of seconds in the banner — the parser itself is unit tested
+    // in-crate (issue #359), this pins the wiring through the CLI.
     let home = temp_home("watch-interval");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
-        .args(["watch", "--network", "not-a-network", "--interval", "30m"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to spawn watch");
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = child.kill();
-    let output = child.wait_with_output().expect("failed to reap watch");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("every 1800s"),
-        "`30m` should resolve to 1800s; got: {stdout}"
-    );
+    for (interval, seconds) in [
+        ("10s", 10),
+        ("30m", 1_800),
+        ("1h", 3_600),
+        ("1d", 86_400),
+        ("60", 60),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+            .args([
+                "watch",
+                "--network",
+                "not-a-network",
+                "--interval",
+                interval,
+            ])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn watch");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("failed to reap watch");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("every {seconds}s")),
+            "`{interval}` should resolve to {seconds}s; got: {stdout}"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -3366,6 +3528,369 @@ fn test_estimate_fn_contract_fixture_populates_footprint_table() {
     assert!(
         stdout.contains("15527"),
         "table should display total fee 15527"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Config-setting cache tests (Issue #302)
+//
+// `estimate-all` needs the same network config settings to price every
+// function it evaluates. These tests pin the in-memory cache: the settings
+// are fetched once per command run and reused for all N functions, so an
+// `estimate-all` costs N simulations + 1 config fetch instead of 2 * N
+// round trips.
+/// Spawns a mock JSON-RPC server that counts requests per method.
+///
+/// Unlike `start_mock_rpc_server`, this one tallies each method separately so a
+/// test can assert how many times config settings were fetched, and it answers
+/// `getLedgerEntries` by echoing the requested keys back so the client can
+/// match entries to config setting IDs the way a real node would.
+#[allow(clippy::too_many_lines)]
+fn start_counting_mock_rpc_server() -> (String, std::sync::mpsc::Sender<()>, Arc<Counts>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx_stop, rx_stop) = std::sync::mpsc::channel::<()>();
+
+    let counts = Arc::new(Counts {
+        get_ledger_entries: AtomicUsize::new(0),
+        batched_config_fetches: AtomicUsize::new(0),
+        simulate_transaction: AtomicUsize::new(0),
+    });
+    let server_counts = Arc::clone(&counts);
+
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("set nonblocking");
+        loop {
+            if rx_stop.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let mut req_str = String::new();
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                req_str.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                if req_str.contains("\r\n\r\n") {
+                                    // Read until the announced body length has arrived.
+                                    let cl = req_str
+                                        .split("Content-Length: ")
+                                        .nth(1)
+                                        .and_then(|v| {
+                                            v.split("\r\n")
+                                                .next()
+                                                .and_then(|c| c.trim().parse::<usize>().ok())
+                                        })
+                                        .unwrap_or(0);
+                                    let body_start = req_str.find("\r\n\r\n").unwrap_or(0) + 4;
+                                    if req_str.len() - body_start >= cl {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    let body = req_str
+                        .split_once("\r\n\r\n")
+                        .map(|(_, b)| b.to_string())
+                        .unwrap_or_default();
+
+                    let resp_body = if req_str.contains("simulateTransaction") {
+                        server_counts
+                            .simulate_transaction
+                            .fetch_add(1, Ordering::SeqCst);
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":"3894195","minResourceFee":"15427","transactionData":"{LIVE_INCREMENT_TX_DATA}"}}}}"#
+                        )
+                    } else if req_str.contains("getHealth") {
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy","latestLedger":3894195}}"#
+                            .to_string()
+                    } else if req_str.contains("getLedgerEntries") {
+                        server_counts
+                            .get_ledger_entries
+                            .fetch_add(1, Ordering::SeqCst);
+                        // A call carrying every config setting's key is the
+                        // batched config fetch; the protocol-limit lookups
+                        // (#322) carry a single key and do not count as one.
+                        let key_count = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["params"]["keys"].as_array().map(|k| k.len()))
+                            .unwrap_or(0);
+                        if key_count >= BATCHED_CONFIG_KEY_COUNT {
+                            server_counts
+                                .batched_config_fetches
+                                .fetch_add(1, Ordering::SeqCst);
+                        }
+                        // Echo every requested key back with a dummy payload so
+                        // the client can complete its key→setting-ID matching.
+                        let entries: Vec<String> = serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|v| v["params"]["keys"].as_array().cloned())
+                            .unwrap_or_default()
+                            .iter()
+                            .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                            .map(|key| {
+                                format!(
+                                    r#"{{"key":"{key}","xdr":"AAAAAAAAAAEAAAAH","lastModifiedLedgerSeq":3894195}}"#
+                                )
+                            })
+                            .collect();
+                        format!(
+                            r#"{{"jsonrpc":"2.0","id":1,"result":{{"latestLedger":3894195,"entries":[{}]}}}}"#,
+                            entries.join(",")
+                        )
+                    } else {
+                        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#
+                            .to_string()
+                    };
+
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{}", addr.port()), tx_stop, counts)
+}
+
+/// Per-method request tallies from `start_counting_mock_rpc_server`.
+struct Counts {
+    get_ledger_entries: std::sync::atomic::AtomicUsize,
+    batched_config_fetches: std::sync::atomic::AtomicUsize,
+    simulate_transaction: std::sync::atomic::AtomicUsize,
+}
+
+/// Number of `ConfigSetting*` keys the batched config fetch sends in a single
+/// `getLedgerEntries` call. The protocol-limit lookups (#322) request one
+/// key per call, so the key count is what separates the two shapes.
+const BATCHED_CONFIG_KEY_COUNT: usize = 6;
+
+/// Writes LEB128-encoded `value` into `wasm`.
+fn write_leb_u32(wasm: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        wasm.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+/// Builds a minimal but valid WASM module exporting `count` zero-argument
+/// functions named `fn_0` … `fn_{count-1}`.
+///
+/// The checked-in fixtures each export a single function, which cannot
+/// distinguish "fetched once" from "fetched once per function". This module
+/// gives the caching tests a real N > 1 to run against.
+///
+/// Each function has a distinct body (`i32.const <i>`) so the resulting
+/// simulation envelopes differ, meaning the client does not collapse them into
+/// one deduplicated request — otherwise the round-trip counts below would be
+/// measuring deduplication rather than the config cache.
+fn multi_function_wasm(count: usize) -> Vec<u8> {
+    let mut wasm = Vec::new();
+
+    // Magic + version 1
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&1u32.to_le_bytes());
+
+    // Type section: 1 type, () -> i32
+    wasm.push(0x01);
+    write_leb_u32(&mut wasm, 5);
+    wasm.push(0x01); // one type
+    wasm.push(0x60); // functype
+    wasm.push(0x00); // no params
+    wasm.push(0x01); // one result
+    wasm.push(0x7f); // i32
+
+    // Function section: `count` functions, all of type 0
+    wasm.push(0x03);
+    write_leb_u32(&mut wasm, 1 + count as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    wasm.extend(std::iter::repeat_n(0x00, count));
+
+    // Export section: each function exported as `fn_<i>`
+    let mut exports: Vec<u8> = Vec::new();
+    for i in 0..count {
+        let name = format!("fn_{i}");
+        write_leb_u32(&mut exports, name.len() as u32);
+        exports.extend_from_slice(name.as_bytes());
+        exports.push(0x00); // func kind
+        exports.push(i as u8); // function index
+    }
+    wasm.push(0x07);
+    write_leb_u32(&mut wasm, 1 + exports.len() as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    wasm.extend_from_slice(&exports);
+
+    // Code section: each body is `(0 locals) i32.const <i>; end`
+    let mut bodies: Vec<Vec<u8>> = Vec::with_capacity(count);
+    let mut code_len = 0usize;
+    for i in 0..count {
+        let mut body = Vec::new();
+        body.push(0x00); // locals declaration vector: no locals
+        body.push(0x41); // i32.const
+        write_leb_u32(&mut body, i as u32);
+        body.push(0x0b); // end
+        // Each entry is prefixed with its own LEB128 length.
+        let mut len_bytes = Vec::new();
+        write_leb_u32(&mut len_bytes, body.len() as u32);
+        code_len += len_bytes.len() + body.len();
+        bodies.push(body);
+    }
+    wasm.push(0x0a);
+    // Section payload = function count (LEB) + every length-prefixed body.
+    write_leb_u32(&mut wasm, 1 + code_len as u32);
+    write_leb_u32(&mut wasm, count as u32);
+    for body in &bodies {
+        write_leb_u32(&mut wasm, body.len() as u32);
+        wasm.extend_from_slice(body);
+    }
+
+    wasm
+}
+
+/// Writes a multi-function WASM module to a temp file and returns its path.
+fn write_multi_function_wasm(home: &Path, count: usize) -> PathBuf {
+    let path = home.join("multi_fn.wasm");
+    std::fs::write(&path, multi_function_wasm(count)).expect("write multi-function wasm");
+    path
+}
+
+#[test]
+fn test_estimate_all_fetches_config_settings_exactly_once() {
+    const FUNCTIONS: usize = 4;
+
+    let (rpc_url, _stop, counts) = start_counting_mock_rpc_server();
+    let home = temp_home("estimate-all-config-cache");
+    let wasm = write_multi_function_wasm(&home, FUNCTIONS);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate-all",
+            "--wasm",
+            wasm.to_str().expect("utf-8 path"),
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rpc-url",
+            &rpc_url,
+            "--json",
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate-all");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate-all should succeed; stderr: {stderr}"
+    );
+
+    let batched_config_fetches = counts
+        .batched_config_fetches
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let simulations = counts
+        .simulate_transaction
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(
+        simulations, FUNCTIONS,
+        "every exported function should be simulated"
+    );
+    // Only the batched six-key call counts here: `estimate-all` also makes
+    // three single-key `getLedgerEntries` lookups for the protocol-limit
+    // warnings (#322), which are unrelated to the fee-rate config cache.
+    assert_eq!(
+        batched_config_fetches, 1,
+        "config settings must be fetched in exactly one batched call per command run, not \
+         once per function (got {batched_config_fetches} batched fetch(es) for \
+         {simulations} function(s))"
+    );
+    assert_eq!(
+        batched_config_fetches + simulations,
+        simulations + 1,
+        "an estimate-all run should cost N simulations + 1 config fetch, not 2 * N round trips"
+    );
+
+    // Sanity check that the run really did produce per-function results.
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON output; got: {stdout}");
+    let results = parsed["functions"]
+        .as_array()
+        .expect("estimate-all JSON has a `functions` array; got: {stdout}");
+    assert_eq!(results.len(), FUNCTIONS);
+    for result in results {
+        assert_eq!(result["status"], "ok", "function result: {result}");
+    }
+}
+
+#[test]
+fn test_estimate_all_table_mode_skips_fee_rate_config_fetch() {
+    // Table output does not itemize fees, so it needs no fee-rate config
+    // settings and must not pay for the batched fetch. (The protocol-limit
+    // warnings (#322) still make their own single-key lookups, which this
+    // test deliberately does not count.)
+    let (rpc_url, _stop, counts) = start_counting_mock_rpc_server();
+    let home = temp_home("estimate-all-no-config");
+    let wasm = write_multi_function_wasm(&home, 3);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .args([
+            "estimate-all",
+            "--wasm",
+            wasm.to_str().expect("utf-8 path"),
+            "--id",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "--rpc-url",
+            &rpc_url,
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("failed to run estimate-all");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "estimate-all should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        counts
+            .batched_config_fetches
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "table mode needs no fee rates, so it should send no batched config fetch"
     );
 }
 
@@ -4839,6 +5364,47 @@ fn test_config_snapshot_diff_makes_no_network_calls() {
         !stderr.contains("failed to locate RPC endpoint"),
         "offline diff must not resolve a network; got: {stderr}"
     );
+}
+
+#[test]
+fn manifest_validates_relative_paths_and_network_overrides_offline() {
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/manifests/valid.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-cost-estimator"))
+        .current_dir(std::env::temp_dir())
+        .env("RUST_LOG", "error")
+        .args(["estimate", "--manifest"])
+        .arg(manifest)
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(entries[0]["function"], "ping");
+    assert_eq!(entries[1]["network"], "local");
+    assert_eq!(entries[1]["rpc_url"], DEAD_RPC);
+}
+
+#[test]
+fn manifest_errors_identify_entry_and_source_before_rpc() {
+    for (fixture, expected) in [
+        ("missing-field", "missing field `function`"),
+        ("unknown-version", "unsupported version 99"),
+        ("invalid-path", "contracts[2]"),
+        ("invalid-function", "unknown function"),
+        ("invalid-args", "expects 0 arguments"),
+    ] {
+        let path = format!("tests/fixtures/manifests/{fixture}.toml");
+        let (_, stderr, code) = run_cli(&["estimate", "--manifest", &path, "--rpc-url", DEAD_RPC]);
+        assert_ne!(code, 0);
+        assert!(stderr.contains(expected), "{fixture}: {stderr}");
+        assert!(stderr.contains(&format!("{path}:")), "{stderr}");
+        assert!(!stderr.contains("failed to send HTTP"), "{stderr}");
+    }
 }
 
 // ── Cache listing and filtered deletion (#516, #517) ───────────────────────

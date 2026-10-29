@@ -1,7 +1,6 @@
-use std::path::PathBuf;
-
 use clap::builder::{PossibleValue, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// Value parser for `--network` that advertises the supported network names to
 /// shell completion generators and `--help` output while still accepting any
@@ -97,6 +96,19 @@ impl ConfigAction {
     }
 }
 
+fn parse_threshold_percent(value: &str) -> Result<f64, String> {
+    let threshold = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid threshold percentage: {value}"))?;
+    if threshold.is_finite() && threshold >= 0.0 {
+        Ok(threshold)
+    } else {
+        Err(format!(
+            "threshold percentage must be a finite, non-negative number: {value}"
+        ))
+    }
+}
+
 /// Build version string with metadata from build.rs
 fn build_version() -> &'static str {
     concat!(
@@ -182,6 +194,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "URL")]
     pub rpc_fallback_url: Option<String>,
 
+    /// HTTP or HTTPS proxy for RPC requests. Takes precedence over standard
+    /// proxy environment variables for this invocation.
+    #[arg(long, global = true, value_name = "URL")]
+    pub rpc_proxy: Option<String>,
+
     /// Retry transient RPC failures up to N times (default 3), using
     /// exponential backoff (500ms, then doubled between attempts). 0
     /// disables retries entirely.
@@ -242,8 +259,12 @@ pub enum Command {
     Estimate {
         /// Path to a compiled Soroban contract `.wasm` file. Repeat the flag
         /// to evaluate multiple contracts in a single batch run.
-        #[arg(long, short, value_name = "PATH", required_unless_present = "wasm_dir")]
+        #[arg(long, short, value_name = "PATH", required_unless_present_any = ["wasm_dir", "manifest"])]
         wasm: Vec<PathBuf>,
+
+        /// Version 1 TOML batch manifest; paths are relative to this file.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["wasm", "wasm_dir", "fn", "args", "id", "interactive", "cache_ttl", "compare", "clear_cache", "no_cache", "history", "auto_snapshot", "diff", "wasm_new", "watch", "project", "repeat"])]
+        manifest: Option<PathBuf>,
 
         /// Directory of `.wasm` files to evaluate as a batch (non-recursive).
         #[arg(long, value_name = "DIR")]
@@ -272,8 +293,8 @@ pub enum Command {
         #[arg(long, short = 'i')]
         interactive: bool,
 
-        /// Skip re-simulation when a cached estimate is still fresh
-        /// (e.g. "30m", "1h", "7d"; bare value = seconds).
+        /// Override the cache freshness TTL from config.toml (default: 7d).
+        /// Accepts "30m", "1h", "7d", or bare seconds.
         #[arg(long, value_name = "DURATION")]
         cache_ttl: Option<String>,
 
@@ -445,7 +466,7 @@ pub enum Command {
         #[arg(long, default_value = "1h")]
         interval: String,
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
     },
 
@@ -807,6 +828,12 @@ pub enum ConfigAction {
         /// older ones once the new snapshot is safely on disk.
         #[arg(long, value_name = "COUNT")]
         retain: Option<usize>,
+
+        /// Do not write a new snapshot when the fetched configuration matches
+        /// the latest snapshot for the network. The command exits 0 whether a
+        /// snapshot was written or skipped.
+        #[arg(long)]
+        skip_unchanged: bool,
     },
     /// List all saved config snapshots with their timestamp and ledger.
     List {
@@ -838,7 +865,7 @@ pub enum ConfigAction {
         pricing_only: bool,
 
         /// Percentage threshold for flagging significant changes (e.g. 10 for 10%).
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", value_parser = parse_threshold_percent)]
         threshold_percent: Option<f64>,
 
         /// Print a single-line summary (counts of pricing/non-pricing changes)
@@ -1039,5 +1066,15 @@ mod tests {
                 "completion script for {shell:?} should reference {bin_name}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn threshold_percent_accepts_finite_non_negative_values() {
+        assert!((parse_threshold_percent("10").unwrap() - 10.0).abs() < f64::EPSILON);
+        assert!((parse_threshold_percent("500.5").unwrap() - 500.5).abs() < f64::EPSILON);
+        assert!(parse_threshold_percent("-1").is_err());
+        assert!(parse_threshold_percent("NaN").is_err());
+        assert!(parse_threshold_percent("inf").is_err());
     }
 }

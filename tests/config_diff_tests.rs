@@ -5,6 +5,7 @@ use soroban_cost_estimator::config_snapshot::model::*;
 
 fn empty_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -21,6 +22,7 @@ fn empty_snapshot() -> ConfigSnapshot {
 
 fn full_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -86,6 +88,7 @@ fn snapshot_with(
     archival: bool,
 ) -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -169,6 +172,7 @@ fn snapshot_with(
 
 fn make_snapshot(compute_fee: i64, bandwidth_fee: i64) -> ConfigSnapshot {
     ConfigSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
         network: "testnet".to_string(),
         timestamp: "2026-01-01T00:00:00Z".to_string(),
         ledger: 100,
@@ -1271,6 +1275,8 @@ fn single_change_diff() -> diff::ConfigDiff {
             change_kind: diff::SettingChangeKind::Value,
             old_state: diff::SettingState::Present("10".to_string()),
             new_state: diff::SettingState::Present("25".to_string()),
+            unit: Some("stroops per 10,000 CPU instructions".to_string()),
+            pricing_classification: Some(PricingClassification::FeeRate),
         }],
         has_pricing_changes: true,
         has_unknown_changes: false,
@@ -1452,6 +1458,58 @@ fn test_presence_change_keeps_a_conservative_pricing_status() {
 }
 
 #[test]
+fn test_decreased_pricing_fields_are_detected_for_every_setting_id() {
+    let old = full_snapshot();
+    let mut new = old.clone();
+
+    new.contract_compute
+        .as_mut()
+        .unwrap()
+        .fee_rate_per_instructions_increment = 5;
+    new.contract_ledger_cost
+        .as_mut()
+        .unwrap()
+        .fee_disk_read_ledger_entry = 50;
+    new.contract_historical_data
+        .as_mut()
+        .unwrap()
+        .fee_historical1_kb = 50;
+    new.contract_events
+        .as_mut()
+        .unwrap()
+        .fee_contract_events1_kb = 25;
+    new.contract_bandwidth.as_mut().unwrap().fee_tx_size1_kb = 5;
+    new.state_archival
+        .as_mut()
+        .unwrap()
+        .persistent_rent_rate_denominator = 50_000;
+
+    let diff = diff::diff_snapshots(&old, &new);
+    assert_eq!(diff.changes.len(), 6);
+    assert!(diff.has_pricing_changes());
+    assert!(diff.changes.iter().all(|change| change.is_pricing_change));
+    assert!(diff.has_significant_pricing_changes(50.0));
+    assert!(diff.changes.iter().all(|change| {
+        change.old_value.parse::<i64>().unwrap() > change.new_value.parse::<i64>().unwrap()
+    }));
+}
+
+#[test]
+fn test_zero_pricing_baseline_and_identical_zero_values() {
+    let unchanged = make_snapshot(0, 0);
+    let identical_diff = diff::diff_snapshots(&unchanged, &unchanged);
+    assert!(identical_diff.changes.is_empty());
+    assert!(!identical_diff.has_pricing_changes());
+    assert!(!identical_diff.has_significant_pricing_changes(0.0));
+
+    let changed = make_snapshot(10, 0);
+    let zero_baseline_diff = diff::diff_snapshots(&unchanged, &changed);
+    assert_eq!(zero_baseline_diff.changes.len(), 1);
+    assert!(zero_baseline_diff.has_pricing_changes());
+    assert!(zero_baseline_diff.has_significant_pricing_changes(0.0));
+}
+
+#[test]
 fn test_snapshot_payload_keeps_known_fields_and_captures_unknown_ones() {
     let json = snapshot_json_with_extras(",\n  \"contract_compute_v1\": {\"fee\": 7}");
     let payload = SnapshotPayload::parse(&json).expect("parse payload");
@@ -1591,4 +1649,156 @@ fn test_diff_summary_mentions_unknown_changes() {
         diff::format_diff_summary(&d),
         "Config drift detected: 1 pricing changes, 0 non-pricing changes, 1 unknown"
     );
+}
+
+// ── Setting units and pricing classification (#513) ─────────────────────────
+
+#[test]
+fn test_json_diff_includes_unit_and_pricing_classification() {
+    let old = make_snapshot(100, 5);
+    let new = make_snapshot(200, 5);
+    let d = diff::diff_snapshots(&old, &new);
+    let json = serde_json::to_value(&d).expect("serialize diff to json");
+    let change = &json["changes"][0];
+
+    assert_eq!(
+        change["field_path"],
+        "contract_compute.fee_rate_per_instructions_increment"
+    );
+    assert_eq!(change["unit"], "stroops per 10,000 CPU instructions");
+    assert_eq!(change["pricing_classification"], "fee_rate");
+    assert_eq!(change["is_pricing_change"], true);
+
+    // In-memory struct matches serialized contract
+    assert_eq!(
+        d.changes[0].unit.as_deref(),
+        Some("stroops per 10,000 CPU instructions")
+    );
+    assert_eq!(
+        d.changes[0].pricing_classification,
+        Some(PricingClassification::FeeRate)
+    );
+    assert!(
+        d.changes[0]
+            .pricing_classification
+            .unwrap()
+            .directly_affects_pricing()
+    );
+}
+
+#[test]
+fn test_representative_fee_rate_limit_and_archival_classifications() {
+    let old = full_snapshot();
+    let mut new = full_snapshot();
+
+    // 1. Representative fee-rate setting
+    new.contract_bandwidth.as_mut().unwrap().fee_tx_size1_kb = 25;
+    // 2. Representative limit setting
+    new.contract_compute
+        .as_mut()
+        .unwrap()
+        .ledger_max_instructions = 2_000_000;
+    new.contract_compute.as_mut().unwrap().tx_memory_limit = 50_000_000;
+    // 3. Representative archival setting
+    new.state_archival.as_mut().unwrap().max_entry_ttl = 8192;
+    new.state_archival.as_mut().unwrap().max_entries_to_archive = 500;
+
+    let d = diff::diff_snapshots(&old, &new);
+    let json = serde_json::to_value(&d).expect("serialize diff");
+    let changes = json["changes"].as_array().expect("changes array");
+
+    let fee_change = changes
+        .iter()
+        .find(|c| c["field_path"] == "contract_bandwidth.fee_tx_size1_kb")
+        .expect("fee change");
+    assert_eq!(fee_change["unit"], "stroops per 1KB");
+    assert_eq!(fee_change["pricing_classification"], "fee_rate");
+    assert_eq!(fee_change["is_pricing_change"], true);
+
+    let instruction_limit_change = changes
+        .iter()
+        .find(|c| c["field_path"] == "contract_compute.ledger_max_instructions")
+        .expect("instruction limit change");
+    assert_eq!(instruction_limit_change["unit"], "instructions");
+    assert_eq!(instruction_limit_change["pricing_classification"], "limit");
+    assert_eq!(instruction_limit_change["is_pricing_change"], false);
+
+    let memory_limit_change = changes
+        .iter()
+        .find(|c| c["field_path"] == "contract_compute.tx_memory_limit")
+        .expect("memory limit change");
+    assert_eq!(memory_limit_change["unit"], "bytes");
+    assert_eq!(memory_limit_change["pricing_classification"], "limit");
+    assert_eq!(memory_limit_change["is_pricing_change"], false);
+
+    let archival_ttl_change = changes
+        .iter()
+        .find(|c| c["field_path"] == "state_archival.max_entry_ttl")
+        .expect("archival ttl change");
+    assert_eq!(archival_ttl_change["unit"], "ledgers");
+    assert_eq!(archival_ttl_change["pricing_classification"], "archival");
+    assert_eq!(archival_ttl_change["is_pricing_change"], false);
+
+    let archival_entries_change = changes
+        .iter()
+        .find(|c| c["field_path"] == "state_archival.max_entries_to_archive")
+        .expect("archival entries change");
+    assert_eq!(archival_entries_change["unit"], "entries");
+    assert_eq!(
+        archival_entries_change["pricing_classification"],
+        "archival"
+    );
+    assert_eq!(archival_entries_change["is_pricing_change"], false);
+}
+
+#[test]
+fn test_unknown_setting_metadata_is_null_in_json() {
+    let old = SnapshotPayload::parse(&snapshot_json_with_extras(",\n  \"brand_new_setting\": 42"))
+        .expect("parse old");
+    let new = SnapshotPayload::parse(&snapshot_json_with_extras("")).expect("parse new");
+
+    let d = diff::diff_payloads(&old, &new);
+    let json = serde_json::to_value(&d).expect("serialize diff");
+    let change = json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["field_path"] == "brand_new_setting")
+        .expect("unknown field change");
+
+    assert!(
+        change["unit"].is_null(),
+        "unknown setting unit should be null, got: {:?}",
+        change["unit"]
+    );
+    assert!(
+        change["pricing_classification"].is_null(),
+        "unknown setting pricing_classification should be null, got: {:?}",
+        change["pricing_classification"]
+    );
+}
+
+#[test]
+fn test_text_and_table_formats_remain_unchanged() {
+    let old = make_snapshot(100, 5);
+    let new = make_snapshot(200, 5);
+    let d = diff::diff_snapshots(&old, &new);
+
+    let text = diff::format_diff(&d, false, false, None);
+    assert!(text.contains("Contract Compute V0 > Fee Rate Per Instructions Increment"));
+    assert!(text.contains("Old: 100"));
+    assert!(text.contains("New: 200"));
+    assert!(!text.contains("fee_rate"));
+
+    let csv = diff::format_diff_csv(&d);
+    assert_eq!(
+        csv,
+        "field,old_value,new_value,is_pricing_change\ncontract_compute.fee_rate_per_instructions_increment,100,200,true\n"
+    );
+
+    let md = diff::format_diff_markdown(&d);
+    assert!(md.contains("| Setting | Old | New | Pricing |"));
+    assert!(md.contains(
+        "| Contract Compute V0 > Fee Rate Per Instructions Increment | `100` | `200` | 💰 yes |"
+    ));
 }
